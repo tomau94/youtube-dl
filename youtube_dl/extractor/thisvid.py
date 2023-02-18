@@ -7,13 +7,16 @@ import itertools
 from .common import InfoExtractor
 from ..compat import (
     compat_urlparse,
+    compat_str,
 )
 from ..utils import (
     clean_html,
     get_element_by_class,
     int_or_none,
     merge_dicts,
+    js_to_json,
     url_or_none,
+    parse_resolution,
     urljoin,
 )
 
@@ -46,6 +49,88 @@ class ThisVidIE(InfoExtractor):
             'age_limit': 18,
         }
     }]
+
+    def _extract_kvs(self, url, webpage, video_id):
+
+        def getlicensetoken(license):
+            modlicense = license.replace('$', '').replace('0', '1')
+            center = int(len(modlicense) / 2)
+            fronthalf = int(modlicense[:center + 1])
+            backhalf = int(modlicense[center:])
+
+            modlicense = compat_str(4 * abs(fronthalf - backhalf))
+
+            def parts():
+                for o in range(0, center + 1):
+                    for i in range(1, 5):
+                        yield compat_str((int(license[o + i]) + int(modlicense[o])) % 10)
+
+            return ''.join(parts())
+
+        def getrealurl(video_url, license_code):
+            if not video_url.startswith('function/0/'):
+                return video_url  # not obfuscated
+
+            url_path, _, url_query = video_url.partition('?')
+            urlparts = url_path.split('/')[2:]
+            license = getlicensetoken(license_code)
+            newmagic = urlparts[5][:32]
+
+            def spells(x, o):
+                l = (o + sum(int(n) for n in license[o:])) % 32
+                for i in range(0, len(x)):
+                    yield {l: x[o], o: x[l]}.get(i, x[i])
+
+            for o in range(len(newmagic) - 1, -1, -1):
+                newmagic = ''.join(spells(newmagic, o))
+
+            urlparts[5] = newmagic + urlparts[5][32:]
+            return '/'.join(urlparts) + '?' + url_query
+
+        flashvars = self._search_regex(
+            r'(?s)<script\b[^>]*>.*?var\s+flashvars\s*=\s*(\{.+?\});.*?</script>',
+            webpage, 'flashvars')
+        flashvars = self._parse_json(flashvars, video_id, transform_source=js_to_json)
+
+        # extract the part after the last / as the display_id from the
+        # canonical URL.
+        display_id = self._search_regex(
+            r'(?:<link href="https?://[^"]+/(.+?)/?" rel="canonical"\s*/?>'
+            r'|<link rel="canonical" href="https?://[^"]+/(.+?)/?"\s*/?>)',
+            webpage, 'display_id', fatal=False
+        )
+        title = self._html_search_regex(r'<(?:h1|title)>(?:Video: )?(.+?)</(?:h1|title)>', webpage, 'title')
+
+        thumbnail = flashvars['preview_url']
+        if thumbnail.startswith('//'):
+            protocol, _, _ = url.partition('/')
+            thumbnail = protocol + thumbnail
+
+        url_keys = list(filter(re.compile(r'^video_(?:url|alt_url\d*)$').match, flashvars.keys()))
+        formats = []
+        for key in url_keys:
+            if '/get_file/' not in flashvars[key]:
+                continue
+            format_id = flashvars.get(key + '_text', key)
+            formats.append(merge_dicts(
+                parse_resolution(format_id) or parse_resolution(flashvars[key]), {
+                    'url': getrealurl(flashvars[key], flashvars['license_code']),
+                    'format_id': format_id,
+                    'ext': 'mp4',
+                    'http_headers': {'Referer': url},
+                }))
+            if not formats[-1].get('height'):
+                formats[-1]['quality'] = 1
+
+        self._sort_formats(formats)
+
+        return {
+            'id': flashvars['video_id'],
+            'display_id': display_id,
+            'title': title,
+            'thumbnail': thumbnail,
+            'formats': formats,
+        }
 
     def _real_extract(self, url):
         main_id, type_ = re.match(self._VALID_URL, url).group('id', 'type')
@@ -80,6 +165,24 @@ class ThisVidIE(InfoExtractor):
             uploader = uploader or None
         else:
             uploader_id = uploader = None
+
+        video_id = self._generic_id(url)
+
+        info_dict = {
+            # '_type': 'url_transparent',
+            'title': title,
+            'age_limit': 18,
+            'uploader': uploader,
+            'uploader_id': uploader_id,
+        }
+
+        # request = sanitized_Request(url)
+        # request.add_header('Accept-Encoding', '*')
+        # full_response = self._request_webpage(request, video_id)
+        # first_bytes = full_response.read(512)
+        # webpage = self._webpage_read_content(full_response, url, video_id, prefix=first_bytes)
+
+        return merge_dicts(self._extract_kvs(url, webpage, video_id), info_dict)
 
         return merge_dicts({
             '_type': 'url_transparent',
